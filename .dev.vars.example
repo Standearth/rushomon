@@ -51,3 +51,15 @@ MAILGUN_API_KEY=your-mailgun-api-key-here
 MAILGUN_DOMAIN=mg.yourdomain.com
 MAILGUN_FROM=invites@mg.yourdomain.com
 MAILGUN_BASE_URL=https://api.mailgun.net
+
+# ─── Polar (optional, required for paid plans) ───────────────────────────────
+# Create an account at: https://polar.sh
+# Use the sandbox environment for local development:
+#   https://sandbox.polar.sh
+#
+# POLAR_ACCESS_TOKEN: Generate at Polar Dashboard → Settings → API
+# POLAR_SANDBOX: Set to "true" for sandbox/staging, "false" for production
+# POLAR_ORG_SLUG: Your Polar organization slug (for admin deep links)
+#
+# Leave all POLAR_* vars empty/unset to disable billing (self-hosted mode).
+# NOTE: POLAR_ACCESS_TOKEN is a worker secret (not var)
