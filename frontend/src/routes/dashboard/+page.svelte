@@ -50,9 +50,7 @@
 		search = (data as any).initialSearch || "";
 		status = (data as any).initialStatus || "all";
 		sort = (data as any).initialSort || "created";
-		selectedTags = (data as any).initialTags
-			? (data as any).initialTags.split(",").filter(Boolean)
-			: [];
+		selectedTags = (data as any).initialTags || [];
 	});
 
 	onMount(async () => {
@@ -80,7 +78,7 @@
 		search = d.initialSearch || "";
 		status = d.initialStatus || "all";
 		sort = d.initialSort || "created";
-		// selectedTags is bindable, initialized from props
+		selectedTags = d.initialTags || [];
 	});
 
 	let linksUsagePercent = $derived(
