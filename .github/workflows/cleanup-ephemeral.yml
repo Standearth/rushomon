@@ -145,44 +145,138 @@ jobs:
           PR_NUMBER: ${{ steps.pr_number.outputs.pr_number }}
         run: |
           BUCKET_NAME="rushomon-assets-pr-$PR_NUMBER"
-
           echo "Attempting to delete R2 bucket: $BUCKET_NAME"
 
-          # Delete the R2 bucket (will fail if non-empty, so purge objects first)
-          LIST_RESPONSE=$(curl -s -X GET \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET_NAME/objects?limit=1000" \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
-
-          KEYS=$(echo "$LIST_RESPONSE" | jq -r '.result.objects[]?.key // empty' 2>/dev/null)
-          if [ -n "$KEYS" ]; then
-            echo "Purging objects from bucket before deletion..."
-            while IFS= read -r key; do
-              curl -s -X DELETE \
-                "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET_NAME/objects/$key" \
-                -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" > /dev/null
-            done <<< "$KEYS"
-          fi
-
-          DELETE_RESPONSE=$(curl -s -X DELETE \
+          # Try to delete the bucket directly first - this is more reliable
+          DELETE_RESPONSE=$(curl -s -w "%{http_code}" -X DELETE \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET_NAME" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
 
-          SUCCESS=$(echo "$DELETE_RESPONSE" | jq -r '.success // false')
+          DELETE_HTTP_CODE="${DELETE_RESPONSE: -3}"
+          DELETE_RESPONSE_BODY="${DELETE_RESPONSE%???}"
 
-          if [ "$SUCCESS" = "true" ]; then
+          if [ "$DELETE_HTTP_CODE" = "204" ] || [ "$DELETE_HTTP_CODE" = "200" ]; then
+            echo "✅ Successfully deleted R2 bucket: $BUCKET_NAME"
+            echo "r2_result=success" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # If direct delete failed, check if bucket exists and has objects
+          echo "Direct delete failed, checking bucket status..."
+
+          # First check if bucket exists
+          BUCKET_LIST_RESPONSE=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+
+          BUCKET_EXISTS=$(echo "$BUCKET_LIST_RESPONSE" | jq -r ".result.buckets[] | select(.name == \"$BUCKET_NAME\") | .name" | head -1 2>/dev/null)
+
+          # If the above fails, try alternative structures
+          if [ -z "$BUCKET_EXISTS" ]; then
+            BUCKET_EXISTS=$(echo "$BUCKET_LIST_RESPONSE" | jq -r ".result[] | select(.name == \"$BUCKET_NAME\") | .name" | head -1 2>/dev/null)
+          fi
+
+          if [ -z "$BUCKET_EXISTS" ]; then
+            echo "⚠️  R2 bucket not found: $BUCKET_NAME (may have already been deleted)"
+            echo "r2_result=not_found" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Bucket exists, proceeding with object cleanup..."
+
+          # List objects in bucket with better error handling
+          LIST_RESPONSE=$(curl -s -w "%{http_code}" -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET_NAME/objects?limit=1000" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+
+          # Extract HTTP code (last 3 characters) and response body
+          HTTP_CODE="${LIST_RESPONSE: -3}"
+          RESPONSE_BODY="${LIST_RESPONSE%???}"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️  Failed to list bucket objects (HTTP $HTTP_CODE)"
+            echo "Response: $RESPONSE_BODY"
+            echo "r2_result=list_failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # Check if bucket has objects with safer jq parsing
+          echo "$RESPONSE_BODY" > /tmp/list_response.json
+          OBJECT_COUNT=$(jq -r '.result | length' /tmp/list_response.json 2>/dev/null || echo "0")
+
+          # Also check if the response indicates any objects at all
+          HAS_OBJECTS=$(jq -r '.result | if length > 0 then "true" else "false" end' /tmp/list_response.json 2>/dev/null || echo "false")
+
+          # Even if object count is 0, try to force delete all versions as there might be versioned objects
+          if [ "$OBJECT_COUNT" -gt 0 ] || [ "$HAS_OBJECTS" = "true" ] || [ "$HTTP_CODE" = "200" ]; then
+            echo "Found $OBJECT_COUNT objects, attempting to purge all versions..."
+
+            # Try to delete all objects including versions
+            PURGE_RESPONSE=$(curl -s -w "%{http_code}" -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET_NAME/objects" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"objects":[{"key":"*"}]}')
+
+            PURGE_HTTP_CODE="${PURGE_RESPONSE: -3}"
+            PURGE_RESPONSE_BODY="${PURGE_RESPONSE%???}"
+
+            # If wildcard purge doesn't work, try individual object deletion
+            if [ "$PURGE_HTTP_CODE" != "200" ] && [ "$OBJECT_COUNT" -gt 0 ]; then
+              echo "Wildcard purge failed, trying individual object deletion..."
+
+              # Delete each object individually using the R2 API
+              while IFS= read -r object_key; do
+                if [ -n "$object_key" ]; then
+                  DELETE_RESPONSE=$(curl -s -w "%{http_code}" -X DELETE \
+                    "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET_NAME/objects/$object_key" \
+                    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+
+                  DELETE_HTTP_CODE="${DELETE_RESPONSE: -3}"
+                  DELETE_RESPONSE_BODY="${DELETE_RESPONSE%???}"
+
+                  if [ "$DELETE_HTTP_CODE" != "200" ] && [ "$DELETE_HTTP_CODE" != "204" ]; then
+                    echo "⚠️  Failed to delete object $object_key (HTTP $DELETE_HTTP_CODE)"
+                    echo "Response: $DELETE_RESPONSE_BODY"
+                    echo "r2_result=object_delete_failed" >> $GITHUB_OUTPUT
+                    exit 1
+                  fi
+                fi
+              done <<< "$(jq -r '.result[].key' /tmp/list_response.json)"
+
+              echo "✅ Successfully deleted all objects individually"
+            fi
+
+            echo "✅ Successfully deleted all objects"
+          else
+            echo "Bucket appears empty, but will attempt deletion anyway..."
+          fi
+
+          # Now delete the bucket
+          DELETE_RESPONSE=$(curl -s -w "%{http_code}" -X DELETE \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$BUCKET_NAME" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+
+          DELETE_HTTP_CODE="${DELETE_RESPONSE: -3}"
+          DELETE_RESPONSE_BODY="${DELETE_RESPONSE%???}"
+
+          if [ "$DELETE_HTTP_CODE" = "204" ] || [ "$DELETE_HTTP_CODE" = "200" ]; then
             echo "✅ Successfully deleted R2 bucket: $BUCKET_NAME"
             echo "r2_result=success" >> $GITHUB_OUTPUT
           else
-            ERROR_CODE=$(echo "$DELETE_RESPONSE" | jq -r '.errors[0].code // ""')
+            # Parse error response
+            SUCCESS=$(echo "$DELETE_RESPONSE_BODY" | jq -r '.success // false' 2>/dev/null || echo "false")
+            ERROR_CODE=$(echo "$DELETE_RESPONSE_BODY" | jq -r '.errors[0].code // ""' 2>/dev/null || echo "")
+
             if [ "$ERROR_CODE" = "10006" ]; then
               echo "⚠️  R2 bucket not found: $BUCKET_NAME (may have already been deleted)"
               echo "r2_result=not_found" >> $GITHUB_OUTPUT
             else
-              echo "⚠️  Failed to delete R2 bucket"
-              echo "Response: $DELETE_RESPONSE"
+              echo "⚠️  Failed to delete R2 bucket (HTTP $DELETE_HTTP_CODE)"
+              echo "Response: $DELETE_RESPONSE_BODY"
               echo "r2_result=failed" >> $GITHUB_OUTPUT
+              exit 1
             fi
-            # Continue anyway - We want to delete all resources
           fi
 
       - name: Post Cleanup Notification
